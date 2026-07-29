@@ -290,10 +290,11 @@ def sync_rosters(supabase):
                 if player_id:
                     supabase.table("players").update({"espn_player_id": espn_pid}).eq("id", player_id).execute()
                 else:
+                    position = athlete.get("position") or {}
                     inserted = supabase.table("players").insert({
                         "espn_player_id": espn_pid,
                         "name": athlete.get("fullName"),
-                        "primary_position": athlete.get("position"),
+                        "primary_position": position.get("abbreviation") or position.get("name"),
                         "current_team_id": team["id"],
                     }).execute().data
                     player_id = inserted[0]["id"]
