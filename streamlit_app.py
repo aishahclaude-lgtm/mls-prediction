@@ -18,6 +18,7 @@ Deploy for free on Streamlit Community Cloud (share.streamlit.io):
      results/predictions shortly after your ingestion job runs.
 """
 import datetime
+import json
 
 import pandas as pd
 import streamlit as st
@@ -249,13 +250,18 @@ with tab_players:
         "This table only includes players with recorded shot/chance-creation data for "
         "the selected season (sourced from ASA's advanced-stats feed) — that's usually "
         "a subset of the full squad, since bench players and some defenders/keepers "
-        "may show zero qualifying actions. See 'Full roster' below for everyone on the team."
+        "may show zero qualifying actions. See 'Full roster' below for everyone on the "
+        "team, defenders included, with 'Goals Added' as the stat that best reflects "
+        "defensive contribution (ASA's goals-added model blends attacking AND defending "
+        "actions like tackles/interceptions/positioning into one number — it isn't "
+        "shot-dependent, so it's meaningful for center-backs and defensive mids too)."
     )
     team_pick = st.selectbox("Team (optional)", ["All"] + sorted(team_name.values()))
 
-    if player_xg.empty or players.empty:
-        st.info("No player season stats yet — run the backfill.")
-    else:
+    merged = pd.DataFrame()
+    seasons = []
+    season_pick = None
+    if not player_xg.empty and not players.empty:
         merged = player_xg.merge(players[["id", "name"]], left_on="player_id", right_on="id", how="left")
         merged["Team"] = merged["team_id"].map(team_name)
         seasons = sorted(merged["season_name"].dropna().unique(), reverse=True)
@@ -276,11 +282,13 @@ with tab_players:
         })
         view = view.sort_values("Goals", ascending=False)
         st.dataframe(view, use_container_width=True, hide_index=True)
+    else:
+        st.info("No player season stats yet — run the backfill.")
 
     st.divider()
     st.subheader("Full roster")
     if team_pick == "All":
-        st.caption("Pick a specific team above to see its full current roster.")
+        st.caption("Pick a specific team above to see its full current roster, stats included.")
     elif "current_team_id" not in players.columns:
         st.info("Roster data not available yet.")
     else:
@@ -293,8 +301,44 @@ with tab_players:
                 "(every 15 min) fills this in from ESPN roster data."
             )
         else:
-            roster = roster[["name", "primary_position", "nationality"]].rename(columns={
-                "name": "Player", "primary_position": "Pos", "nationality": "Nationality",
-            }).sort_values("Player")
-            st.caption(f"{len(roster)} players currently on {team_pick}'s roster.")
+            # Position sometimes comes through as a raw ESPN {"abbreviation": ...} blob
+            # for players first added via roster sync — unpack it into a clean string.
+            def _clean_pos(val):
+                if isinstance(val, str) and val.strip().startswith("{"):
+                    try:
+                        d = json.loads(val)
+                        return d.get("abbreviation") or d.get("name") or val
+                    except Exception:
+                        return val
+                return val
+            roster["Pos"] = roster["primary_position"].apply(_clean_pos)
+
+            # Left-join season stats (if a season is selected) so EVERY roster player
+            # gets a row here — including defenders/keepers who had zero shots and so
+            # were filtered out of the table above. Goals Added is the column to look
+            # at for non-attackers since it's not shot-dependent.
+            stat_cols = ["Min", "Goals", "xG", "Assists", "xA", "Shots", "SOT", "Goals Added"]
+            if not merged.empty and season_pick:
+                season_stats = merged[merged["season_name"] == season_pick][[
+                    "player_id", "minutes_played", "goals", "xgoals",
+                    "primary_assists", "xassists", "shots", "shots_on_target", "points_added",
+                ]].rename(columns={
+                    "minutes_played": "Min", "goals": "Goals", "xgoals": "xG",
+                    "primary_assists": "Assists", "xassists": "xA", "shots": "Shots",
+                    "shots_on_target": "SOT", "points_added": "Goals Added",
+                })
+                roster = roster.merge(season_stats, left_on="id", right_on="player_id", how="left")
+            else:
+                for c in stat_cols:
+                    roster[c] = None
+
+            roster = roster[["name", "Pos", "nationality"] + stat_cols].rename(columns={
+                "name": "Player", "nationality": "Nationality",
+            })
+            roster["Goals Added"] = roster["Goals Added"].fillna(0)
+            roster = roster.sort_values("Goals Added", ascending=False)
+            st.caption(
+                f"{len(roster)} players currently on {team_pick}'s roster"
+                + (f" — stats for {season_pick}." if season_pick else ". Pick a season above for stats.")
+            )
             st.dataframe(roster, use_container_width=True, hide_index=True)
