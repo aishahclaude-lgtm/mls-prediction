@@ -174,6 +174,13 @@ with tab_standings:
     if not model_runs.empty:
         st.divider()
         st.subheader("Model accuracy over time")
+        st.caption(
+            "Overall accuracy of the model across ALL games, not broken down by team. "
+            "Each row is one retrain (happens automatically on every ingestion run). "
+            "'Test accuracy' = % of held-out past games where the model correctly called "
+            "the outcome (home win / draw / away win). 'Baseline' = accuracy you'd get by "
+            "always guessing 'home team wins' — the bar the model needs to beat."
+        )
         acc_rows = []
         for _, r in model_runs.iterrows():
             m = r.get("accuracy_metrics") or {}
@@ -238,6 +245,14 @@ with tab_h2h:
 # ============================================================
 with tab_players:
     st.subheader("Player season stats (xG / xA / goals added)")
+    st.caption(
+        "This table only includes players with recorded shot/chance-creation data for "
+        "the selected season (sourced from ASA's advanced-stats feed) — that's usually "
+        "a subset of the full squad, since bench players and some defenders/keepers "
+        "may show zero qualifying actions. See 'Full roster' below for everyone on the team."
+    )
+    team_pick = st.selectbox("Team (optional)", ["All"] + sorted(team_name.values()))
+
     if player_xg.empty or players.empty:
         st.info("No player season stats yet — run the backfill.")
     else:
@@ -245,7 +260,6 @@ with tab_players:
         merged["Team"] = merged["team_id"].map(team_name)
         seasons = sorted(merged["season_name"].dropna().unique(), reverse=True)
         season_pick = st.selectbox("Season", seasons) if seasons else None
-        team_pick = st.selectbox("Team (optional)", ["All"] + sorted(team_name.values()))
 
         view = merged[merged["season_name"] == season_pick] if season_pick else merged
         if team_pick != "All":
@@ -262,3 +276,25 @@ with tab_players:
         })
         view = view.sort_values("Goals", ascending=False)
         st.dataframe(view, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Full roster")
+    if team_pick == "All":
+        st.caption("Pick a specific team above to see its full current roster.")
+    elif "current_team_id" not in players.columns:
+        st.info("Roster data not available yet.")
+    else:
+        id_by_name = {v: k for k, v in team_name.items()}
+        team_id_pick = id_by_name.get(team_pick)
+        roster = players[players["current_team_id"] == team_id_pick].copy()
+        if roster.empty:
+            st.info(
+                "No roster synced for this team yet — the live ingestion job "
+                "(every 15 min) fills this in from ESPN roster data."
+            )
+        else:
+            roster = roster[["name", "primary_position", "nationality"]].rename(columns={
+                "name": "Player", "primary_position": "Pos", "nationality": "Nationality",
+            }).sort_values("Player")
+            st.caption(f"{len(roster)} players currently on {team_pick}'s roster.")
+            st.dataframe(roster, use_container_width=True, hide_index=True)
