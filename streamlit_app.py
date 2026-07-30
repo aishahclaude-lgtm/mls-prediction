@@ -399,13 +399,30 @@ with tab_chat:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+    # Words like "City"/"United"/"FC" show up in half the league's names, so
+    # matching on any single one of them (the old logic) made almost every
+    # query look "ambiguous" (e.g. "New York City FC" tripped on "City" and
+    # pulled in Orlando City, Sporting KC, St. Louis City too). Generic words
+    # are excluded from matching entirely; only distinctive words count.
+    _GENERIC_TEAM_WORDS = {
+        "fc", "sc", "city", "united", "real", "union", "town", "county",
+        "athletic", "club",
+    }
+
     def _find_teams_in_text(text):
         text_l = text.lower()
         matches = []
         for tid, name in team_name.items():
             name_l = name.lower()
-            words = [w for w in re.sub(r"\bfc\b", "", name_l).split() if len(w) >= 4]
-            if name_l in text_l or any(re.search(rf"\b{re.escape(w)}\b", text_l) for w in words):
+            if name_l in text_l:
+                matches.append(tid)
+                continue
+            clean = re.sub(r"[^a-z0-9\s]", "", name_l)
+            words = [
+                w for w in clean.split()
+                if len(w) >= 4 and w not in _GENERIC_TEAM_WORDS
+            ]
+            if words and any(re.search(rf"\b{re.escape(w)}\b", text_l) for w in words):
                 matches.append(tid)
         for tid, abbr in team_abbr.items():
             abbr_l = (abbr or "").lower()
