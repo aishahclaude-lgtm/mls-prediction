@@ -19,6 +19,7 @@ Deploy for free on Streamlit Community Cloud (share.streamlit.io):
 """
 import datetime
 import json
+import re
 
 import pandas as pd
 import streamlit as st
@@ -53,6 +54,29 @@ div[data-testid="stDataFrame"] {
     font-family: "Courier New", Courier, monospace !important;
 }
 hr { border-top: 1px solid #ddd; }
+
+/* ---- Mobile tweaks: tighter padding, smaller text, scrollable tabs ---- */
+@media (max-width: 640px) {
+    .block-container {
+        padding-left: 0.75rem !important;
+        padding-right: 0.75rem !important;
+        padding-top: 1.5rem !important;
+    }
+    h1 { font-size: 1.4rem !important; }
+    h2, h3 { font-size: 1.1rem !important; }
+    [data-testid="stMetricValue"] { font-size: 1.2rem !important; }
+    [data-testid="stMetricLabel"] { font-size: 0.7rem !important; }
+    div[data-testid="stDataFrame"] { font-size: 0.75rem !important; }
+    .stTabs [data-baseweb="tab-list"] {
+        overflow-x: auto !important;
+        flex-wrap: nowrap !important;
+    }
+    .stTabs [data-baseweb="tab"] {
+        font-size: 0.8rem !important;
+        padding: 0.4rem 0.55rem !important;
+        white-space: nowrap !important;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -120,8 +144,8 @@ st.caption(
     f"Last model run: {model_runs.iloc[0]['trained_at'] if not model_runs.empty else 'never'}."
 )
 
-tab_pred, tab_standings, tab_h2h, tab_players = st.tabs(
-    ["Upcoming Predictions", "Elo Standings", "Head-to-Head", "Player Stats"]
+tab_pred, tab_standings, tab_h2h, tab_players, tab_chat = st.tabs(
+    ["Predictions", "Standings", "H2H", "Players", "Ask"]
 )
 
 # ============================================================
@@ -144,18 +168,21 @@ with tab_pred:
             when = g["date_time_utc"].strftime("%a %b %d, %Y — %H:%M UTC")
 
             with st.container(border=True):
-                cols = st.columns([3, 1, 1, 1])
-                cols[0].markdown(f"**{home}** vs **{away}**  \n{when}" + (f"  \n_{venue}_" if venue else ""))
+                # Matchup info gets its own full-width line (readable at any screen
+                # size) instead of sharing a row with the metrics — a [3,1,1,1]
+                # column split gets uncomfortably cramped on a phone-width screen.
+                st.markdown(f"**{home}** vs **{away}**  \n{when}" + (f"  \n_{venue}_" if venue else ""))
                 if pred:
-                    cols[1].metric("Home win", f"{pred['predicted_home_win_pct']:.0f}%")
-                    cols[2].metric("Draw", f"{pred['predicted_draw_pct']:.0f}%")
-                    cols[3].metric("Away win", f"{pred['predicted_away_win_pct']:.0f}%")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Home win", f"{pred['predicted_home_win_pct']:.0f}%")
+                    m2.metric("Draw", f"{pred['predicted_draw_pct']:.0f}%")
+                    m3.metric("Away win", f"{pred['predicted_away_win_pct']:.0f}%")
                     st.caption(
                         f"Predicted score: {home} {pred['predicted_home_score']:.1f} — "
                         f"{pred['predicted_away_score']:.1f} {away}"
                     )
                 else:
-                    cols[1].write("(no prediction yet)")
+                    st.caption("(no prediction yet)")
 
 # ============================================================
 # Tab 2 — Elo standings / power rankings
@@ -169,7 +196,8 @@ with tab_standings:
         standings = standings.sort_values("elo_rating", ascending=False).reset_index(drop=True)
         standings.insert(0, "Rank", standings.index + 1)
         standings = standings[["Rank", "name", "abbreviation", "elo_rating", "attack_rating", "defense_rating"]]
-        standings.columns = ["Rank", "Team", "Abbr", "Elo", "Attack (goals/gm)", "Defense (goals/gm allowed)"]
+        standings.columns = ["Rank", "Team", "Abbr", "Elo", "Attack", "Defense"]
+        st.caption("Attack/Defense = avg goals scored/conceded per game (last 20). Swipe the table sideways to see every column.")
         st.dataframe(standings, use_container_width=True, hide_index=True)
 
     if not model_runs.empty:
@@ -187,9 +215,10 @@ with tab_standings:
             m = r.get("accuracy_metrics") or {}
             acc_rows.append({
                 "Trained at": r["trained_at"],
-                "Test accuracy": m.get("test_accuracy"),
-                "Baseline (always home win)": m.get("baseline_accuracy"),
-                "Training rows": r.get("training_row_count"),
+                "Test acc.": m.get("test_accuracy"),
+                "Baseline": m.get("baseline_accuracy"),
+                "CV acc.": m.get("cv_accuracy"),
+                "Rows": r.get("training_row_count"),
             })
         st.dataframe(pd.DataFrame(acc_rows), use_container_width=True, hide_index=True)
 
@@ -342,3 +371,140 @@ with tab_players:
                 + (f" — stats for {season_pick}." if season_pick else ". Pick a season above for stats.")
             )
             st.dataframe(roster, use_container_width=True, hide_index=True)
+
+# ============================================================
+# Tab 5 — Ask (rule-based matchup assistant, no external AI)
+# ============================================================
+with tab_chat:
+    st.subheader("Ask about a matchup")
+    st.caption(
+        "This isn't a general chatbot — it's a small rule-based helper that only answers "
+        "from this app's own predictions and ratings. If it can't find a real scheduled game "
+        "between the two teams, or isn't sure who you mean, it asks before guessing instead "
+        "of making one up."
+    )
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = [{
+            "role": "assistant",
+            "content": (
+                "Ask me something like \"who's going to win Miami vs Vancouver?\" — I'll look "
+                "for a real scheduled match between them first."
+            ),
+        }]
+    if "pending_hypothetical" not in st.session_state:
+        st.session_state.pending_hypothetical = None
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    def _find_teams_in_text(text):
+        text_l = text.lower()
+        matches = []
+        for tid, name in team_name.items():
+            name_l = name.lower()
+            words = [w for w in re.sub(r"\bfc\b", "", name_l).split() if len(w) >= 4]
+            if name_l in text_l or any(re.search(rf"\b{re.escape(w)}\b", text_l) for w in words):
+                matches.append(tid)
+        for tid, abbr in team_abbr.items():
+            abbr_l = (abbr or "").lower()
+            if abbr_l and re.search(rf"\b{re.escape(abbr_l)}\b", text_l) and tid not in matches:
+                matches.append(tid)
+        return matches
+
+    def _answer_matchup(a_id, b_id):
+        # Only answer from a REAL scheduled game with a real model prediction —
+        # never fabricate one from scratch, per the "don't blind-guess" rule.
+        cand = games[
+            (games["status"] == "scheduled")
+            & (
+                ((games["home_team_id"] == a_id) & (games["away_team_id"] == b_id))
+                | ((games["home_team_id"] == b_id) & (games["away_team_id"] == a_id))
+            )
+        ].copy()
+        if len(cand) == 1:
+            g = cand.iloc[0]
+            pred = None
+            if not predictions.empty:
+                m = predictions[predictions["game_id"] == g["id"]]
+                if not m.empty:
+                    pred = m.iloc[0]
+            home, away = team_name.get(g["home_team_id"]), team_name.get(g["away_team_id"])
+            when = pd.to_datetime(g["date_time_utc"]).strftime("%a %b %d, %Y — %H:%M UTC")
+            if pred is None:
+                return (
+                    f"Found the scheduled match **{home}** vs **{away}** on {when}, but there's "
+                    f"no model prediction for it yet — check back after the next retrain."
+                )
+            return (
+                f"**{home}** vs **{away}** — {when}\n\n"
+                f"- Home win: {pred['predicted_home_win_pct']:.0f}%\n"
+                f"- Draw: {pred['predicted_draw_pct']:.0f}%\n"
+                f"- Away win: {pred['predicted_away_win_pct']:.0f}%\n\n"
+                f"Predicted score: {home} {pred['predicted_home_score']:.1f} — "
+                f"{pred['predicted_away_score']:.1f} {away}\n\n"
+                f"_Based on the model's Elo, recent form, head-to-head, venue, and rest-day "
+                f"features for this specific matchup._"
+            )
+        elif len(cand) > 1:
+            opts = "; ".join(
+                f"{team_name.get(r['home_team_id'])} vs {team_name.get(r['away_team_id'])} on "
+                f"{pd.to_datetime(r['date_time_utc']).strftime('%b %d')}"
+                for _, r in cand.iterrows()
+            )
+            return f"There's more than one scheduled meeting between these teams: {opts}. Which one did you mean?"
+        else:
+            st.session_state.pending_hypothetical = (a_id, b_id)
+            return (
+                f"I don't see an upcoming scheduled match between **{team_name.get(a_id)}** and "
+                f"**{team_name.get(b_id)}** in the data, so I don't want to guess blind. Want a "
+                f"rough hypothetical instead, using each team's current Elo rating on a neutral "
+                f"field (no venue, rest, form, or head-to-head factored in — much less reliable "
+                f"than a real prediction)? Reply \"yes\" if so, or tell me the actual matchup you meant."
+            )
+
+    def _hypothetical_answer(a_id, b_id):
+        if "elo_rating" not in teams.columns:
+            return "Ratings haven't been computed yet, so I can't even do a rough estimate — run the model once first."
+        elo = dict(zip(teams["id"], teams["elo_rating"]))
+        ea, eb = elo.get(a_id), elo.get(b_id)
+        if ea is None or eb is None or pd.isna(ea) or pd.isna(eb):
+            return "Missing Elo ratings for one of these teams — can't estimate."
+        diff = ea - eb
+        p_a = 1 / (1 + 10 ** (-diff / 400))
+        return (
+            f"Rough neutral-field estimate only (Elo-only — ignores venue/rest/form/head-to-head, "
+            f"and doesn't model draws, so treat this as a coin-flip-plus-lean, not a real prediction): "
+            f"**{team_name.get(a_id)}** ({ea:.0f} Elo) vs **{team_name.get(b_id)}** ({eb:.0f} Elo) "
+            f"→ **{team_name.get(a_id)}** ~{p_a * 100:.0f}% / **{team_name.get(b_id)}** ~{(1 - p_a) * 100:.0f}%. "
+            f"For a real prediction, wait for this matchup to be added to the schedule."
+        )
+
+    user_msg = st.chat_input('e.g. "who wins Miami vs Vancouver"')
+    if user_msg:
+        st.session_state.chat_history.append({"role": "user", "content": user_msg})
+
+        pending = st.session_state.pending_hypothetical
+        low = user_msg.strip().lower()
+        if pending and low in ("yes", "y", "sure", "yeah", "yep", "ok", "okay"):
+            reply = _hypothetical_answer(*pending)
+            st.session_state.pending_hypothetical = None
+        else:
+            st.session_state.pending_hypothetical = None
+            found = _find_teams_in_text(user_msg)
+            if len(found) == 0:
+                reply = (
+                    "I couldn't match any team names in that. Try naming both teams, e.g. "
+                    '"who wins Inter Miami vs Vancouver Whitecaps".'
+                )
+            elif len(found) == 1:
+                reply = f"Got **{team_name.get(found[0])}** — who are they playing?"
+            elif len(found) > 2:
+                names = ", ".join(team_name.get(t) for t in found)
+                reply = f"That matched more than two teams ({names}) — which two did you mean?"
+            else:
+                reply = _answer_matchup(found[0], found[1])
+
+        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        st.rerun()
