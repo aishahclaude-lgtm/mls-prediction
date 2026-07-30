@@ -409,6 +409,19 @@ with tab_chat:
         "athletic", "club",
     }
 
+    # A word can still be ambiguous even if it's not generic — "York" isn't
+    # a filler word, but it's shared by both New York City FC and New York
+    # Red Bulls, so matching on it alone would silently pull in both. Only
+    # words that belong to exactly one team's name are trusted as a
+    # single-word match; anything shared across teams falls back to needing
+    # the full name (or abbreviation) to appear instead.
+    _word_team_ids = {}
+    for _tid, _name in team_name.items():
+        _clean = re.sub(r"[^a-z0-9\s]", "", _name.lower())
+        for _w in _clean.split():
+            if len(_w) >= 4 and _w not in _GENERIC_TEAM_WORDS:
+                _word_team_ids.setdefault(_w, set()).add(_tid)
+
     def _find_teams_in_text(text):
         text_l = text.lower()
         matches = []
@@ -421,6 +434,7 @@ with tab_chat:
             words = [
                 w for w in clean.split()
                 if len(w) >= 4 and w not in _GENERIC_TEAM_WORDS
+                and len(_word_team_ids.get(w, ())) == 1
             ]
             if words and any(re.search(rf"\b{re.escape(w)}\b", text_l) for w in words):
                 matches.append(tid)
