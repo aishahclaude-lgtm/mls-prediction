@@ -217,6 +217,34 @@ create table model_runs (
 );
 
 -- ============================================================
+-- AWARD PREDICTIONS — MLS end-of-season awards (MVP, Golden Boot, Shield,
+-- MLS Cup, etc), recomputed by awards.py at the end of every predict.py
+-- retrain. Fully overwritten each run (delete-all + reinsert) rather than
+-- upserted, since the shape of the top-5 for an award can change entirely
+-- between runs. is_proxy/proxy_note flag the awards this database only has
+-- a rough stand-in signal for (no coaches/goalkeeper/defensive stats) —
+-- the dashboard should show those visibly lower-confidence, not as real
+-- picks. See awards.py for exactly what each award_key measures.
+-- ============================================================
+create table award_predictions (
+    id              uuid primary key default uuid_generate_v4(),
+    award_key       text not null,      -- e.g. 'mvp', 'golden_boot', 'supporters_shield'
+    award_name      text not null,      -- display name, e.g. 'Landon Donovan MLS MVP'
+    season_name     text,
+    model_version   text,
+    rank            integer not null,   -- 1 = current favorite
+    entity_type     text not null,      -- 'player' | 'team'
+    entity_id       uuid,               -- player id or team id
+    entity_name     text not null,
+    subtitle        text,               -- team + stat line, or points/Elo for team awards
+    win_pct         numeric not null,
+    is_proxy        boolean not null default false,
+    proxy_note      text,
+    updated_at      timestamptz default now()
+);
+create index idx_award_predictions_award on award_predictions(award_key);
+
+-- ============================================================
 -- Realtime: tell Supabase to broadcast changes on the tables the dashboard
 -- needs to react to live (run this after creating the tables above).
 -- ============================================================
@@ -224,3 +252,4 @@ alter publication supabase_realtime add table games;
 alter publication supabase_realtime add table team_game_stats;
 alter publication supabase_realtime add table player_game_stats;
 alter publication supabase_realtime add table predictions;
+alter publication supabase_realtime add table award_predictions;

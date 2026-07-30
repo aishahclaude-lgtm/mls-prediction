@@ -29,6 +29,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from common import fetch_all
+from awards import compute_and_write_awards
 
 MODEL_VERSION = "elo_form_v2"
 BASE_ELO = 1500
@@ -189,7 +190,8 @@ def train_and_predict(supabase):
     print("Loading games...")
     games = fetch_all(
         supabase, "games",
-        "id,date_time_utc,home_team_id,away_team_id,venue_id,home_score,away_score,status",
+        "id,date_time_utc,home_team_id,away_team_id,venue_id,home_score,away_score,status,"
+        "season_name,knockout_game",
         order_col="date_time_utc",
     )
     for g in games:
@@ -313,6 +315,17 @@ def train_and_predict(supabase):
         }, on_conflict="game_id").execute()
         pred_count += 1
     print(f"Wrote {pred_count} predictions.")
+
+    try:
+        compute_and_write_awards(
+            supabase, team_ids=team_ids, finished=finished, upcoming=upcoming,
+            elo=elo, home_adv=home_adv,
+            attack={t: team_attack(t) for t in team_ids},
+            defense={t: team_defense(t) for t in team_ids},
+        )
+    except Exception as e:  # noqa: BLE001 - awards are a bonus feature; never let them break match predictions
+        print(f"Awards computation failed (match predictions above are unaffected): {e}")
+
     return clf_full, elo
 
 

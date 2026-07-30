@@ -122,10 +122,11 @@ def load_data():
     players = pd.DataFrame(fetch_all("players"))
     player_season_xgoals = pd.DataFrame(fetch_all("player_season_xgoals"))
     model_runs = pd.DataFrame(fetch_all("model_runs", order_col="trained_at", desc=True))
-    return teams, venues, games, predictions, players, player_season_xgoals, model_runs
+    awards = pd.DataFrame(fetch_all("award_predictions"))
+    return teams, venues, games, predictions, players, player_season_xgoals, model_runs, awards
 
 
-teams, venues, games, predictions, players, player_xg, model_runs = load_data()
+teams, venues, games, predictions, players, player_xg, model_runs, awards = load_data()
 
 if teams.empty or games.empty:
     st.warning(
@@ -144,8 +145,8 @@ st.caption(
     f"Last model run: {model_runs.iloc[0]['trained_at'] if not model_runs.empty else 'never'}."
 )
 
-tab_pred, tab_standings, tab_h2h, tab_players, tab_chat = st.tabs(
-    ["Predictions", "Standings", "H2H", "Players", "Ask"]
+tab_pred, tab_standings, tab_h2h, tab_players, tab_awards, tab_chat = st.tabs(
+    ["Predictions", "Standings", "H2H", "Players", "Awards", "Ask"]
 )
 
 # ============================================================
@@ -373,7 +374,94 @@ with tab_players:
             st.dataframe(roster, use_container_width=True, hide_index=True)
 
 # ============================================================
-# Tab 5 — Ask (rule-based matchup assistant, no external AI)
+# Tab 5 — Awards (end-of-season award predictions, from awards.py)
+# ============================================================
+with tab_awards:
+    st.subheader("Award predictions")
+    st.caption(
+        "Recomputed from live stats every retrain (same ~15-minute cycle as the match "
+        "predictions), not just guessed once at the start of the season."
+    )
+
+    if awards.empty:
+        st.info(
+            "No award predictions yet — these show up once predict.py has run with "
+            "award_predictions in place (see schema.sql) and enough of the season "
+            "has been played to have real stats to work from."
+        )
+    else:
+        season_pick_a = st.selectbox(
+            "Season", sorted(awards["season_name"].dropna().unique(), reverse=True),
+            key="awards_season",
+        )
+        season_awards = awards[awards["season_name"] == season_pick_a]
+
+        st.caption(
+            "⭐ = low-confidence proxy. This database doesn't track coaches, goalkeeper "
+            "saves, defensive actions, or injury history, so those awards (and the "
+            "goalkeeper/defender slots in Best XI) use a rough stand-in instead of real "
+            "signal — read the caption under each one before trusting it. Referee of the "
+            "Year, Assistant Referee of the Year, Goal of the Year, Save of the Year, and "
+            "the Audi Goals Drive Progress Impact Award aren't attempted at all — nothing "
+            "in this database bears on officiating, highlight-reel goals/saves, or "
+            "community work, even loosely."
+        )
+
+        def render_award(key):
+            rows = season_awards[season_awards["award_key"] == key].sort_values("rank")
+            if rows.empty:
+                return
+            first = rows.iloc[0]
+            title = f"⭐ {first['award_name']}" if first["is_proxy"] else first["award_name"]
+            st.markdown(f"#### {title}")
+            if first["is_proxy"] and first["proxy_note"]:
+                st.caption(first["proxy_note"])
+            for _, r in rows.iterrows():
+                c1, c2 = st.columns([5, 1])
+                sub = f"  \n:gray[{r['subtitle']}]" if r.get("subtitle") else ""
+                c1.markdown(f"{int(r['rank'])}. **{r['entity_name']}**{sub}")
+                c2.markdown(f"**{r['win_pct']:.0f}%**")
+            st.divider()
+
+        SOLID_ORDER = [
+            "mvp", "golden_boot", "young_player", "newcomer",
+            "supporters_shield", "mls_cup",
+        ]
+        for key in SOLID_ORDER:
+            render_award(key)
+
+        # Best XI is a roster pick, not a single-winner award, so it's laid out as one
+        # list per slot instead of the ranked/percentage format above — a %-share
+        # number doesn't mean much when the "prize" is one of eleven starting spots.
+        best_xi_keys = [
+            ("best_xi_gk", 1, "Goalkeeper"), ("best_xi_d", 4, "Defenders"),
+            ("best_xi_m", 3, "Midfielders"), ("best_xi_f", 3, "Forwards"),
+        ]
+        if any(not season_awards[season_awards["award_key"] == k].empty for k, _, _ in best_xi_keys):
+            st.markdown("#### MLS Best XI")
+            st.caption(
+                "This app's picks for the season's best XI — goalkeeper and defender "
+                "slots are ⭐ proxies (same no-defensive-stats caveat as Goalkeeper/"
+                "Defender of the Year above); midfield and forward slots use real goal/"
+                "assist/goals-added numbers."
+            )
+            for key, n_slots, label in best_xi_keys:
+                rows = season_awards[season_awards["award_key"] == key].sort_values("rank").head(n_slots)
+                if rows.empty:
+                    continue
+                is_proxy = bool(rows.iloc[0]["is_proxy"])
+                st.markdown(("⭐ " if is_proxy else "") + f"**{label}**")
+                for _, r in rows.iterrows():
+                    sub = f" — :gray[{r['subtitle']}]" if r.get("subtitle") else ""
+                    st.markdown(f"- {r['entity_name']}{sub}")
+            st.divider()
+
+        PROXY_ORDER = ["coach_of_the_year", "goalkeeper", "defender", "comeback_player", "mls_cup_mvp"]
+        for key in PROXY_ORDER:
+            render_award(key)
+
+# ============================================================
+# Tab 6 — Ask (rule-based matchup assistant, no external AI)
 # ============================================================
 with tab_chat:
     st.subheader("Ask about a matchup")
