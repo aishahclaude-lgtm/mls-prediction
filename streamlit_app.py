@@ -178,9 +178,12 @@ with tab_pred:
                     m1.metric("Home win", f"{pred['predicted_home_win_pct']:.0f}%")
                     m2.metric("Draw", f"{pred['predicted_draw_pct']:.0f}%")
                     m3.metric("Away win", f"{pred['predicted_away_win_pct']:.0f}%")
+                    conf = pred.get("confidence")
+                    conf_icon = {"High": "🟢", "Medium": "🟡", "Low": "🔴"}.get(conf, "")
                     st.caption(
                         f"Predicted score: {home} {pred['predicted_home_score']:.1f} — "
                         f"{pred['predicted_away_score']:.1f} {away}"
+                        + (f"   {conf_icon} **{conf} confidence**" if conf else "")
                     )
                 else:
                     st.caption("(no prediction yet)")
@@ -209,7 +212,10 @@ with tab_standings:
             "Each row is one retrain (happens automatically on every ingestion run). "
             "'Test accuracy' = % of held-out past games where the model correctly called "
             "the outcome (home win / draw / away win). 'Baseline' = accuracy you'd get by "
-            "always guessing 'home team wins' — the bar the model needs to beat."
+            "always guessing 'home team wins' — the bar the model needs to beat. "
+            "'Brier' measures whether the percentages themselves are trustworthy (lower is "
+            "better; ~0.667 is a coin-flip guess) — a model can get the winner right most of "
+            "the time and still be a bad Brier score if its confidence is off."
         )
         acc_rows = []
         for _, r in model_runs.iterrows():
@@ -219,6 +225,8 @@ with tab_standings:
                 "Test acc.": m.get("test_accuracy"),
                 "Baseline": m.get("baseline_accuracy"),
                 "CV acc.": m.get("cv_accuracy"),
+                "Brier": m.get("test_brier"),
+                "Brier baseline": m.get("baseline_brier"),
                 "Rows": r.get("training_row_count"),
             })
         st.dataframe(pd.DataFrame(acc_rows), use_container_width=True, hide_index=True)
@@ -556,15 +564,19 @@ with tab_chat:
                     f"Found the scheduled match **{home}** vs **{away}** on {when}, but there's "
                     f"no model prediction for it yet — check back after the next retrain."
                 )
+            conf = pred.get("confidence")
+            conf_line = f"\n\nConfidence: **{conf}**" if conf else ""
             return (
                 f"**{home}** vs **{away}** — {when}\n\n"
                 f"- Home win: {pred['predicted_home_win_pct']:.0f}%\n"
                 f"- Draw: {pred['predicted_draw_pct']:.0f}%\n"
-                f"- Away win: {pred['predicted_away_win_pct']:.0f}%\n\n"
+                f"- Away win: {pred['predicted_away_win_pct']:.0f}%\n"
+                f"{conf_line}\n\n"
                 f"Predicted score: {home} {pred['predicted_home_score']:.1f} — "
                 f"{pred['predicted_away_score']:.1f} {away}\n\n"
-                f"_Based on the model's Elo, recent form, head-to-head, venue, and rest-day "
-                f"features for this specific matchup._"
+                f"_Based on the model's Elo, recent form, head-to-head, venue, rest-day, and "
+                f"prior-season xG features for this specific matchup — probabilities are "
+                f"calibrated, not raw model output._"
             )
         elif len(cand) > 1:
             opts = "; ".join(

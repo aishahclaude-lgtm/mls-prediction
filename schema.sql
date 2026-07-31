@@ -200,6 +200,8 @@ create table predictions (
     predicted_away_win_pct    numeric,
     predicted_home_score      numeric,
     predicted_away_score      numeric,
+    confidence                text,     -- 'High' | 'Medium' | 'Low' — how far the top
+                                         -- probability sits above a coin-flip guess
     created_at                timestamptz default now()
 );
 create index idx_predictions_game on predictions(game_id);
