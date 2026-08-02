@@ -145,8 +145,10 @@ st.caption(
     f"Last model run: {model_runs.iloc[0]['trained_at'] if not model_runs.empty else 'never'}."
 )
 
-tab_pred, tab_record, tab_standings, tab_h2h, tab_players, tab_awards, tab_chat = st.tabs(
-    ["Predictions", "Our Record", "Standings", "H2H", "Players", "Awards", "Ask"]
+(tab_pred, tab_record, tab_models, tab_standings, tab_h2h,
+ tab_players, tab_awards, tab_chat) = st.tabs(
+    ["Predictions", "Our Record", "Models", "Standings", "H2H",
+     "Players", "Awards", "Ask"]
 )
 
 # ============================================================
@@ -185,6 +187,54 @@ with tab_pred:
                         f"{pred['predicted_away_score']:.1f} {away}"
                         + (f"   {conf_icon} **{conf} confidence**" if conf else "")
                     )
+                    # --- the specialist lanes -----------------------------
+                    # Each of these comes from a DIFFERENT model - the one
+                    # measured best at that job. See the Models tab.
+                    bd = pred.get("model_breakdown")
+                    if isinstance(bd, str):
+                        try:
+                            bd = json.loads(bd)
+                        except (ValueError, TypeError):
+                            bd = None
+                    if isinstance(bd, dict):
+                        s1, s2, s3 = st.columns(3)
+                        wl_team = home if bd.get("wl_pick") == "home" else away
+                        wl_pct = bd.get("wl_home_pct")
+                        if wl_pct is not None:
+                            shown = wl_pct if bd.get("wl_pick") == "home" else 1 - wl_pct
+                            s1.metric("Win/Loss call", wl_team,
+                                      f"{shown*100:.0f}% of a decisive result",
+                                      delta_color="off")
+                        risk = bd.get("draw_risk", "-")
+                        risk_icon = {"Low": "\U0001F7E2", "Medium": "\U0001F7E1",
+                                     "High": "\U0001F7E0"}.get(risk, "")
+                        s2.metric("Draw risk", f"{risk_icon} {risk}",
+                                  "vs 23% league base rate", delta_color="off")
+                        s3.metric("Dixon-Coles draw",
+                                  f"{bd.get('dc_draw_pct', 0)*100:.0f}%",
+                                  "calls a draw" if bd.get("dc_calls_draw") else "no draw call",
+                                  delta_color="off")
+
+                        with st.expander("What each model said"):
+                            comp = bd.get("components", {})
+                            lbl = {"poisson": "Poisson (goals)",
+                                   "dixon_coles": "Dixon-Coles (draws)",
+                                   "logistic": "Logistic (form)"}
+                            crows = []
+                            for ck, cn in lbl.items():
+                                cv = comp.get(ck)
+                                if cv:
+                                    crows.append({"Model": cn, home: f"{cv[2]*100:.0f}%",
+                                                  "Draw": f"{cv[1]*100:.0f}%",
+                                                  away: f"{cv[0]*100:.0f}%"})
+                            if crows:
+                                st.dataframe(pd.DataFrame(crows),
+                                             use_container_width=True, hide_index=True)
+                            st.caption(
+                                "Three separate models, not three runs of one. The headline "
+                                "percentages above come from the Poisson row. They are "
+                                "deliberately **not** averaged - see the Models tab."
+                            )
                 else:
                     st.caption("(no prediction yet)")
 
@@ -311,6 +361,116 @@ with tab_record:
                     "Confidence": r.get("confidence") or "",
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+# ============================================================
+# Tab 2 - Models (how the predictions are actually made)
+# ============================================================
+with tab_models:
+    st.subheader("How we predict")
+    st.markdown(
+        "Every number on the Predictions tab comes from a model picked for "
+        "**one specific job**, because no single model was best at all of them. "
+        "Here is what each one does, why it was chosen, and how well it performs."
+    )
+
+    st.markdown("### The three specialists")
+    st.dataframe(pd.DataFrame([
+        {"Job": "Win / Loss call",
+         "Model": "Half-weighted logistic",
+         "What it does": "Two-class home-vs-away model trained on every game, "
+                         "counting each draw as half-evidence for both sides.",
+         "How good": "AUC 0.627 - best home/away discrimination measured"},
+        {"Job": "Draw risk",
+         "Model": "Dixon-Coles",
+         "What it does": "Per-team attack and defence ratings, a correction for "
+                         "low-scoring games (0-0, 1-1), and time decay so older "
+                         "results count less.",
+         "How good": "34% precision when it calls a draw, vs a 23% base rate"},
+        {"Job": "The percentages",
+         "Model": "Poisson goal model",
+         "What it does": "Predicts each side's goal rate, then adds up every "
+                         "scoreline to get win / draw / loss probabilities.",
+         "How good": "Brier 0.6243 - best-calibrated single model measured"},
+    ]), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Is this an ensemble?")
+    st.markdown(
+        "**No, and that is deliberate.** An *ensemble* is many models voting on "
+        "the same question, blended into one number. What runs here is "
+        "**model specialisation**: each model answers a *different* question and "
+        "owns its answer outright. Nothing is averaged."
+    )
+    st.info(
+        "We tested the ensemble version. Averaging the three scores slightly "
+        "better on calibration (Brier 0.6206 vs 0.6243) - but it produces one "
+        "blended number no single model is accountable for. Specialisation keeps "
+        "every figure traceable to one identifiable model, for about 0.004 of "
+        "Brier. That trade was made on purpose."
+    )
+    st.caption(
+        "Worth knowing: averaging three models also beat averaging eight "
+        "(0.6206 vs 0.6212). Past a handful, extra members add noise, not signal."
+    )
+
+    st.divider()
+    st.markdown("### Why the pick can disagree with the percentages")
+    st.markdown(
+        "The Win/Loss call comes from a different model than the percentages, so "
+        "occasionally the highest percentage and the Win/Loss call point different "
+        "ways. That is expected rather than a bug - it means the two models "
+        "genuinely disagree, which is itself a signal the game is close. The "
+        "percentages are the better-calibrated number; the Win/Loss call is the "
+        "better discriminator between two decisive outcomes."
+    )
+
+    st.divider()
+    st.markdown("### Why draws are hard")
+    st.markdown(
+        "Draws are about **23%** of MLS results, and no model reliably calls them. "
+        "For a draw to be the single most likely outcome it has to clear 33% "
+        "probability - across 1,095 test games that happened **three times**. "
+        "That is why a draw is rarely the headline pick, and it is correct "
+        "behaviour rather than a defect."
+    )
+    st.markdown(
+        "The draw-risk band is the honest version of a draw prediction. Games are "
+        "split into thirds by draw probability; here is what those bands actually "
+        "delivered in backtesting:"
+    )
+    st.dataframe(pd.DataFrame([
+        {"Draw risk": "Low", "Actual draw rate": "18.8%", "vs base rate": "0.81x"},
+        {"Draw risk": "Medium", "Actual draw rate": "24.8%", "vs base rate": "1.07x"},
+        {"Draw risk": "High", "Actual draw rate": "27.3%", "vs base rate": "1.18x"},
+    ]), use_container_width=True, hide_index=True)
+    st.caption(
+        "Real and consistently ordered, but modest - a 1.45x spread from Low to "
+        "High. Treat it as a nudge, not a forecast."
+    )
+
+    st.divider()
+    st.markdown("### How this was validated")
+    st.markdown(
+        "Every model is scored by **walk-forward backtesting**: train on the past, "
+        "predict the next block of games, roll forward, repeat. A model never sees "
+        "a game before predicting it, so these numbers reflect real forecasting "
+        "rather than fitting history. Roughly 1,100 out-of-sample games were used."
+    )
+    st.markdown(
+        "For scale: three-way football prediction tops out near **55%** even for "
+        "models built on betting-market odds, because roughly a third of matches "
+        "turn on red cards, deflections and early goals no pre-match model can "
+        "see. MLS is harder than most leagues by design - the salary cap "
+        "compresses team quality, which is why it has had 11 different champions "
+        "in 15 years where the big European leagues had 3."
+    )
+    st.caption(
+        "Around 30 model variants were tested to arrive at these three, including "
+        "bivariate Poisson, ordered logit and probit, zero-inflated Poisson, "
+        "gradient boosting, random forests, two-stage hybrids and polynomial "
+        "feature expansion. Most landed within three points of each other."
+    )
+
+
 
 # ============================================================
 # Tab 2 — Elo standings / power rankings
