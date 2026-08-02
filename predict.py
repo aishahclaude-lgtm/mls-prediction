@@ -53,6 +53,7 @@ from sklearn.preprocessing import StandardScaler
 
 from common import fetch_all
 from awards import compute_and_write_awards
+from specialists import Specialists
 
 MODEL_VERSION = "elo_form_xg_travel_draw_v5"
 BASE_ELO = 1500
@@ -411,6 +412,27 @@ def train_and_predict(supabase):
     X = np.array([[r[f] for f in FEATURE_NAMES] for r in rows])
     y = np.array([r["label"] for r in rows])
 
+    # ---- specialist committee -------------------------------------------
+    # Three models, three jobs. NOT an ensemble: nothing is averaged. Each
+    # lane is answered by the single model the offline study measured best at
+    # that lane. See specialists.py for the numbers behind each choice.
+    team_index = {t: i for i, t in enumerate(sorted(team_ids))}
+    specialists = None
+    try:
+        hs_arr = np.array([g["home_score"] for g in finished], float)
+        as_arr = np.array([g["away_score"] for g in finished], float)
+        hidx = np.array([team_index[g["home_team_id"]] for g in finished])
+        aidx = np.array([team_index[g["away_team_id"]] for g in finished])
+        ref_date = finished[-1]["date_time_utc"]
+        days_ago = np.clip(np.array(
+            [(ref_date - g["date_time_utc"]).days for g in finished], float), 0, None)
+        specialists = Specialists(FEATURE_NAMES).fit(
+            X, y, hs_arr, as_arr, hidx, aidx, days_ago, len(team_index))
+        print(f"  Specialist committee fitted (Dixon-Coles rho={specialists.dc_.rho_:+.3f}).")
+    except Exception as e:  # noqa: BLE001 - extras must never break the main prediction
+        print(f"  Specialist committee failed to fit ({e}) - main model unaffected.")
+        specialists = None
+
     n_splits = min(5, max(2, len(rows) // 30))
     tscv = TimeSeriesSplit(n_splits=n_splits)
     model_fn = _candidate_models()[model_name]
@@ -553,6 +575,14 @@ def train_and_predict(supabase):
                  home_form_gd, away_form_gd, rest_diff, xg_prior_diff,
                  momentum_diff, travel_diff, surface_fit_diff]]
 
+        breakdown = None
+        if specialists is not None and specialists.ok:
+            try:
+                breakdown = specialists.predict(
+                    feat[0], team_index[home], team_index[away])
+            except Exception:  # noqa: BLE001
+                breakdown = None
+
         probs = clf_full.predict_proba(feat)[0]
         prob_by_class = dict(zip(clf_full.classes_, probs))
         p_away = float(prob_by_class.get(0, 0))
@@ -571,6 +601,7 @@ def train_and_predict(supabase):
             "predicted_home_score": round(home_xg, 2),
             "predicted_away_score": round(away_xg, 2),
             "confidence": confidence,
+            "model_breakdown": breakdown,
         }, on_conflict="game_id").execute()
         pred_count += 1
     print(f"Wrote {pred_count} predictions.")
