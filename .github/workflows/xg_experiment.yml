@@ -1,0 +1,30 @@
+name: xG experiment (read-only)
+
+# Manual only. This job WRITES NOTHING — it fetches game-level xG from ASA,
+# backtests the candidate features against the current baseline, prints a table
+# and exits. Nothing about the live pipeline changes until you read the output
+# and decide something is worth keeping.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run the xG feature experiment
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python xg_experiment.py
