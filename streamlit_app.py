@@ -145,8 +145,8 @@ st.caption(
     f"Last model run: {model_runs.iloc[0]['trained_at'] if not model_runs.empty else 'never'}."
 )
 
-tab_pred, tab_standings, tab_h2h, tab_players, tab_awards, tab_chat = st.tabs(
-    ["Predictions", "Standings", "H2H", "Players", "Awards", "Ask"]
+tab_pred, tab_record, tab_standings, tab_h2h, tab_players, tab_awards, tab_chat = st.tabs(
+    ["Predictions", "Our Record", "Standings", "H2H", "Players", "Awards", "Ask"]
 )
 
 # ============================================================
@@ -183,10 +183,134 @@ with tab_pred:
                     st.caption(
                         f"Predicted score: {home} {pred['predicted_home_score']:.1f} — "
                         f"{pred['predicted_away_score']:.1f} {away}"
-                        + (f"   {conf_icon} **{conf} confidence**" if conf else "")
+                        + (f"   {conf_icon} **{conf} confidence**" if conf else "")
                     )
                 else:
                     st.caption("(no prediction yet)")
+
+# ============================================================
+# Tab 1.5 — Our Record (the model's actual W-L track record)
+# ============================================================
+with tab_record:
+    st.subheader("Our Record")
+    st.caption(
+        "Every finished game is matched back to the prediction that existed for it "
+        "BEFORE it was played (predictions only get overwritten for games still "
+        "scheduled, so a finished game's row is untouched — this is a real track "
+        "record, not hindsight). 'Correct' = the highest-probability outcome we "
+        "called (home / draw / away) matches what actually happened."
+    )
+
+    finished_g = games[
+        (games["status"] == "final") & games["home_score"].notna() & games["away_score"].notna()
+    ].copy()
+
+    if predictions.empty or finished_g.empty:
+        st.info("No finished games with predictions yet — check back once some scheduled games play out.")
+    else:
+        record = finished_g.merge(predictions, left_on="id", right_on="game_id", how="inner")
+        if record.empty:
+            st.info(
+                "No finished games have a matching prediction yet — predictions only "
+                "started being written once the model had this feature, so older "
+                "results won't show up here."
+            )
+        else:
+            def _actual(row):
+                if row["home_score"] == row["away_score"]:
+                    return "draw"
+                return "home" if row["home_score"] > row["away_score"] else "away"
+
+            def _predicted(row):
+                probs = {
+                    "home": row["predicted_home_win_pct"],
+                    "draw": row["predicted_draw_pct"],
+                    "away": row["predicted_away_win_pct"],
+                }
+                return max(probs, key=probs.get)
+
+            record["actual"] = record.apply(_actual, axis=1)
+            record["predicted"] = record.apply(_predicted, axis=1)
+            record["correct"] = record["predicted"] == record["actual"]
+            record["date_time_utc"] = pd.to_datetime(record["date_time_utc"])
+            record = record.sort_values("date_time_utc").reset_index(drop=True)
+
+            wins = int(record["correct"].sum())
+            losses = int((~record["correct"]).sum())
+            total = len(record)
+            win_pct = (wins / total * 100) if total else 0.0
+            baseline_wins = int((record["actual"] == "home").sum())
+
+            # Current streak — walk backward from the most recent game while the
+            # W/L direction stays the same.
+            streak_len, streak_dir = 0, None
+            for c in record["correct"].iloc[::-1]:
+                if streak_dir is None:
+                    streak_dir = c
+                    streak_len = 1
+                elif c == streak_dir:
+                    streak_len += 1
+                else:
+                    break
+            streak_label = "—"
+            if streak_dir is not None:
+                streak_label = f"{'W' if streak_dir else 'L'}{streak_len}"
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Record", f"{wins}-{losses}")
+            m2.metric("Win rate", f"{win_pct:.1f}%")
+            m3.metric("Current streak", streak_label)
+            m4.metric(
+                "vs. always-pick-home",
+                f"{baseline_wins}-{total - baseline_wins}",
+                delta=f"{wins - baseline_wins:+d} calls",
+            )
+
+            st.divider()
+            st.markdown("**Accuracy by call type** — are we better at calling home wins, away wins, or draws?")
+            by_type = (
+                record.groupby("predicted")["correct"]
+                .agg(calls="count", accuracy="mean")
+                .reindex(["home", "draw", "away"])
+            )
+            by_type["accuracy"] = (by_type["accuracy"] * 100).round(1)
+            by_type.index = ["Home win calls", "Draw calls", "Away win calls"]
+            st.dataframe(by_type.rename(columns={"calls": "Calls made", "accuracy": "Accuracy %"}),
+                         use_container_width=True)
+
+            if "confidence" in record.columns and record["confidence"].notna().any():
+                st.markdown("**Accuracy by confidence tier** — do High-confidence calls actually hit more?")
+                by_conf = (
+                    record.groupby("confidence")["correct"]
+                    .agg(calls="count", accuracy="mean")
+                    .reindex(["High", "Medium", "Low"])
+                    .dropna(how="all")
+                )
+                by_conf["accuracy"] = (by_conf["accuracy"] * 100).round(1)
+                st.dataframe(by_conf.rename(columns={"calls": "Calls made", "accuracy": "Accuracy %"}),
+                             use_container_width=True)
+
+            if total >= 5:
+                st.divider()
+                st.markdown("**Rolling accuracy** (trailing 10 games)")
+                record["rolling_acc"] = record["correct"].rolling(10, min_periods=3).mean() * 100
+                st.line_chart(record.set_index("date_time_utc")["rolling_acc"])
+
+            st.divider()
+            st.markdown("**Last 15 calls** (most recent first)")
+            recent = record.sort_values("date_time_utc", ascending=False).head(15)
+            rows = []
+            for _, r in recent.iterrows():
+                home, away = team_name.get(r["home_team_id"], "?"), team_name.get(r["away_team_id"], "?")
+                rows.append({
+                    "": "✅" if r["correct"] else "❌",
+                    "Date": r["date_time_utc"].strftime("%Y-%m-%d"),
+                    "Matchup": f"{home} {int(r['home_score'])}-{int(r['away_score'])} {away}",
+                    "We called": r["predicted"].capitalize(),
+                    "Actually happened": r["actual"].capitalize(),
+                    "Confidence": r.get("confidence") or "",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # ============================================================
 # Tab 2 — Elo standings / power rankings
