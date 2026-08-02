@@ -54,7 +54,7 @@ from sklearn.preprocessing import StandardScaler
 from common import fetch_all
 from awards import compute_and_write_awards
 
-MODEL_VERSION = "elo_form_xg_travel_v4"
+MODEL_VERSION = "elo_form_xg_travel_draw_v5"
 BASE_ELO = 1500
 FORM_WINDOW = 5          # games of recent form to average over
 REST_CAP_DAYS = 14       # clip rest-days-difference so one huge gap doesn't dominate
@@ -66,12 +66,18 @@ K_FACTOR_GRID = [15, 20, 25, 30]
 HOME_ADV_GRID = [40, 65, 90]
 
 FEATURE_NAMES = [
-    "elo_diff", "h2h_home_ppg", "venue_ppg",
+    "elo_diff", "abs_elo_diff", "h2h_home_ppg", "h2h_draw_rate", "venue_ppg",
     "home_form_ppg", "away_form_ppg",
     "home_form_gd", "away_form_gd",
     "rest_diff", "xg_prior_diff",
     "momentum_diff", "travel_diff", "surface_fit_diff",
 ]
+# abs_elo_diff and h2h_draw_rate exist specifically so the model has a real
+# signal for draws: closely-matched teams (small |elo_diff|) and pairs with
+# a history of drawing each other are the two strongest real-world draw
+# predictors, and neither is representable from the other (linear) features
+# alone — elo_diff is signed, so a plain linear model can't learn a
+# "closer = more draws" U-shape without the absolute-value version explicitly.
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -152,7 +158,7 @@ def _brier_score(y_true, probs, classes):
     """Multiclass Brier score: mean squared error between predicted
     probabilities and the one-hot actual outcome. 0 = perfect, ~0.667 =
     what a uniform 33/33/33 guess scores for 3 classes. Lower is better —
-    this is what actually tells you whether the *percentages* can be
+    this is what actually tells you whether the *percentages* are
     trusted, which accuracy alone can't.
     """
     y_true = np.asarray(y_true)
@@ -163,7 +169,7 @@ def _brier_score(y_true, probs, classes):
     return float(np.mean(np.sum((probs - onehot) ** 2, axis=1)))
 
 
-def _build_features(finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, venues):
+def _build_features(finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, venues, league_draw_rate=0.24):
     """One causal (no-lookahead) pass through finished games, already sorted by date.
 
     Returns (rows, elo, h2h, venue_form, recent, last_played, goals_for, goals_against,
@@ -188,6 +194,7 @@ def _build_features(finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, v
         home, away, venue, date = g["home_team_id"], g["away_team_id"], g["venue_id"], g["date_time_utc"]
 
         elo_diff = (elo[home] + home_adv) - elo[away]
+        abs_elo_diff = abs(elo_diff)
 
         pair = tuple(sorted([home, away]))
         h2h_list = h2h.get(pair, [])
@@ -195,6 +202,7 @@ def _build_features(finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, v
             sum(3 if w == home else (1 if w is None else 0) for w in h2h_list) / len(h2h_list)
             if h2h_list else 1.3
         )
+        h2h_draw_rate = (h2h_list.count(None) / len(h2h_list)) if h2h_list else league_draw_rate
 
         vf_list = venue_form.get((home, venue), [])
         venue_ppg = (sum(vf_list) / len(vf_list)) if vf_list else 1.5
@@ -247,7 +255,8 @@ def _build_features(finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, v
             label = 1
 
         rows.append({
-            "elo_diff": elo_diff, "h2h_home_ppg": h2h_home_ppg, "venue_ppg": venue_ppg,
+            "elo_diff": elo_diff, "abs_elo_diff": abs_elo_diff,
+            "h2h_home_ppg": h2h_home_ppg, "h2h_draw_rate": h2h_draw_rate, "venue_ppg": venue_ppg,
             "home_form_ppg": home_form_ppg, "away_form_ppg": away_form_ppg,
             "home_form_gd": home_form_gd, "away_form_gd": away_form_gd,
             "rest_diff": rest_diff, "xg_prior_diff": xg_prior_diff,
@@ -289,19 +298,24 @@ def _build_features(finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, v
 
 
 def _candidate_models():
-    """A small model zoo — grid search picks whichever cross-validates best.
+    """A model zoo — grid search picks whichever cross-validates best.
 
-    Logistic regression (plain and class-balanced, to give draws a fairer
-    shot) plus a gradient-boosted tree model, which can pick up feature
-    interactions (e.g. "big Elo edge AND well-rested") that logistic
-    regression can't.
+    Logistic regression at a few regularization strengths (plain and
+    class-balanced, to give draws — the minority class — a fair shot at
+    actually winning the argmax instead of being drowned out by home/away)
+    plus gradient-boosted trees at a couple of depths, which can pick up
+    feature interactions (e.g. "small |Elo edge| AND a history of draws
+    between these two teams") that logistic regression can't.
     """
     return {
-        "logreg": lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=1.0)),
+        "logreg_c0.3": lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=0.3)),
+        "logreg_c1": lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=1.0)),
+        "logreg_c3": lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=3.0)),
         "logreg_balanced": lambda: make_pipeline(
             StandardScaler(), LogisticRegression(max_iter=2000, C=1.0, class_weight="balanced")
         ),
-        "hist_gb": lambda: HistGradientBoostingClassifier(max_depth=3, max_iter=150, random_state=42),
+        "hist_gb_d3": lambda: HistGradientBoostingClassifier(max_depth=3, max_iter=150, random_state=42),
+        "hist_gb_d2": lambda: HistGradientBoostingClassifier(max_depth=2, max_iter=150, random_state=42),
     }
 
 
@@ -318,14 +332,14 @@ def _cv_score(X, y, model_fn, n_splits):
     return float(np.mean(accs)) if accs else None
 
 
-def _select_best_config(finished, xg_prior_fn, overall_avg_xg, venues):
+def _select_best_config(finished, xg_prior_fn, overall_avg_xg, venues, league_draw_rate=0.24):
     """Grid-search (k_factor, home_adv, model) by walk-forward CV accuracy.
 
     Falls back to the old hardcoded defaults when there isn't enough history
     yet to cross-validate reliably (early in a season / fresh database).
     """
     if len(finished) < 40:
-        return 20, 65, "logreg", None
+        return 20, 65, "logreg_c1", None
 
     n_splits = min(5, max(2, len(finished) // 30))
     best = None  # (cv_acc, k, home_adv, model_name)
@@ -333,7 +347,7 @@ def _select_best_config(finished, xg_prior_fn, overall_avg_xg, venues):
 
     for k in K_FACTOR_GRID:
         for home_adv in HOME_ADV_GRID:
-            rows, *_ = _build_features(finished, k, home_adv, xg_prior_fn, overall_avg_xg, venues)
+            rows, *_ = _build_features(finished, k, home_adv, xg_prior_fn, overall_avg_xg, venues, league_draw_rate)
             X = np.array([[r[f] for f in FEATURE_NAMES] for r in rows])
             y = np.array([r["label"] for r in rows])
             for name, model_fn in models.items():
@@ -344,7 +358,7 @@ def _select_best_config(finished, xg_prior_fn, overall_avg_xg, venues):
                     best = (acc, k, home_adv, name)
 
     if best is None:
-        return 20, 65, "logreg", None
+        return 20, 65, "logreg_c1", None
     return best[1], best[2], best[3], best[0]
 
 
@@ -375,8 +389,16 @@ def train_and_predict(supabase):
     print("Loading venues (for travel distance / pitch surface)...")
     venues = {v["id"]: v for v in fetch_all(supabase, "venues", "id,latitude,longitude,is_turf")}
 
+    league_draw_rate = (
+        float(np.mean([1.0 if g["home_score"] == g["away_score"] else 0.0 for g in finished]))
+        if finished else 0.24
+    )
+    print(f"  League draw rate (fallback for pairs with no h2h history): {league_draw_rate:.3f}")
+
     print("Grid-searching Elo/model hyperparameters via walk-forward CV...")
-    k_factor, home_adv, model_name, cv_acc = _select_best_config(finished, xg_prior_fn, overall_avg_xg, venues)
+    k_factor, home_adv, model_name, cv_acc = _select_best_config(
+        finished, xg_prior_fn, overall_avg_xg, venues, league_draw_rate
+    )
     print(
         f"  Best config: K={k_factor}, HOME_ADV={home_adv}, model={model_name}"
         + (f", CV accuracy={cv_acc:.3f}" if cv_acc is not None else " (default — not enough history to grid-search yet)")
@@ -384,7 +406,7 @@ def train_and_predict(supabase):
 
     (rows, elo, h2h, venue_form, recent, last_played, goals_for, goals_against,
      last_venue, streak, surface_record) = _build_features(
-        finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, venues
+        finished, k_factor, home_adv, xg_prior_fn, overall_avg_xg, venues, league_draw_rate
     )
     X = np.array([[r[f] for f in FEATURE_NAMES] for r in rows])
     y = np.array([r["label"] for r in rows])
@@ -420,10 +442,14 @@ def train_and_predict(supabase):
     baseline_brier = _brier_score(y[test_idx], uniform_probs, clf.classes_)
     test_log_loss = float(log_loss(y[test_idx], test_probs, labels=clf.classes_))
 
+    pred_draw_count = int(np.sum(test_pred_labels == 1))
+    actual_draw_count = int(np.sum(y[test_idx] == 1))
     print(
         f"Held-out fold accuracy: {test_acc}  (baseline 'always home win': {baseline_acc})\n"
         f"Held-out Brier: {test_brier:.4f}  (uniform-guess baseline: {baseline_brier:.4f})  "
-        f"log loss: {test_log_loss:.4f}"
+        f"log loss: {test_log_loss:.4f}\n"
+        f"Draws predicted on held-out fold: {pred_draw_count}/{len(test_idx)}  "
+        f"(actual draws in that fold: {actual_draw_count}) — confirms draw predictions are actually functional, not just theoretical"
     )
 
     n_splits_full = min(5, max(2, len(rows) // 30))
@@ -473,12 +499,14 @@ def train_and_predict(supabase):
         if home not in elo or away not in elo:
             continue
         elo_diff = (elo[home] + home_adv) - elo[away]
+        abs_elo_diff = abs(elo_diff)
         pair = tuple(sorted([home, away]))
         h2h_list = h2h.get(pair, [])
         h2h_home_ppg = (
             sum(3 if w == home else (1 if w is None else 0) for w in h2h_list) / len(h2h_list)
             if h2h_list else 1.3
         )
+        h2h_draw_rate = (h2h_list.count(None) / len(h2h_list)) if h2h_list else league_draw_rate
         vf_list = venue_form.get((home, venue), [])
         venue_ppg = (sum(vf_list) / len(vf_list)) if vf_list else 1.5
 
@@ -520,7 +548,8 @@ def train_and_predict(supabase):
             if hn >= MIN_SURFACE_SAMPLE and an >= MIN_SURFACE_SAMPLE:
                 surface_fit_diff = (hw / hn) - (aw / an)
 
-        feat = [[elo_diff, h2h_home_ppg, venue_ppg, home_form_ppg, away_form_ppg,
+        feat = [[elo_diff, abs_elo_diff, h2h_home_ppg, h2h_draw_rate, venue_ppg,
+                 home_form_ppg, away_form_ppg,
                  home_form_gd, away_form_gd, rest_diff, xg_prior_diff,
                  momentum_diff, travel_diff, surface_fit_diff]]
 
